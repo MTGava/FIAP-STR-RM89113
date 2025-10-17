@@ -1,113 +1,213 @@
-/*
- * SPDX-FileCopyrightText: 2010-2022 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: CC0-1.0
- */
-
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <inttypes.h>
-#include "sdkconfig.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_chip_info.h"
-#include "esp_flash.h"
+#include "freertos/queue.h"
+
 #include "esp_system.h"
+#include "esp_task_wdt.h"
+#include "esp_heap_caps.h"
 
-// Add semaphore
-#include "freertos/semphr.h"
+/* Prioridades */
+#define GEN_TASK_PRIO      6 
+#define RX_TASK_PRIO       5
+#define SUP_TASK_PRIO      4
 
-SemaphoreHandle_t xBinarySemaphore1 = NULL;
-SemaphoreHandle_t xBinarySemaphore2 = NULL;
-SemaphoreHandle_t xBinarySemaphore3 = NULL;
+#define GEN_STACK_WORDS    4096
+#define RX_STACK_WORDS     4096
+#define SUP_STACK_WORDS    4096
 
-void vTask1(void *pvParameters) {
-    int vez = 1; // alterna entre semáforos
-    while (1) 
-    {
-        if(vez == 1) {
-            xSemaphoreGive(xBinarySemaphore1); // Libera o semáforo 1
-            vez = 2; // Alterna para o semáforo 2
-        } else if (vez == 2) {
-            xSemaphoreGive(xBinarySemaphore2); // Libera o semáforo 2
-            vez = 3; // Alterna para o semáforo 3
+#define QUEUE_LEN          10
+#define QUEUE_ITEM_SIZE    sizeof(int)
+
+/* TIMEOUTS */
+#define GEN_PERIOD_MS            150
+#define RX_TIMEOUT_MS            1000
+#define SUP_PERIOD_MS            1500
+#define STALL_TICKS(ms)          pdMS_TO_TICKS(ms)
+#define WDT_TIMEOUT_SECONDS      5
+
+/* Handles globais */
+static QueueHandle_t g_queue = NULL;
+static TaskHandle_t g_task_gen = NULL;
+static TaskHandle_t g_task_rx  = NULL;
+static TaskHandle_t g_task_sup = NULL;
+
+/* Heartbeats para monitoramento */
+static volatile TickType_t g_hb_gen = 0;
+static volatile TickType_t g_hb_rx  = 0;
+static volatile TickType_t g_hb_sup = 0;
+
+static volatile bool g_flag_gen_ok = false;
+static volatile bool g_flag_rx_ok  = false;
+
+// Módulo 1 – Geração de Dados
+static void task_geradora(void *pv) {
+    esp_task_wdt_add(NULL);
+
+    int value = 0;
+    for (;;) {
+        if (xQueueSend(g_queue, &value, 0) == pdTRUE) {
+            g_hb_gen = xTaskGetTickCount();
+            g_flag_gen_ok = true;
+            printf("{Matheus Gava Silva - RM:89113} [GERADOR] Valor: %d enfileirado.\n", value);
+            value++;
         } else {
-            xSemaphoreGive(xBinarySemaphore3); // Libera o semáforo 3
-            vez = 1; // Alterna para o semáforo 1
+            printf("{Matheus Gava Silva - RM:89113} [GERADOR] Valor: %d descartado (fila cheia).\n", value);
+            value++;
         }
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Delay de 1 segundo
+
+        UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
+        if (watermark < 100) {
+            printf("{Matheus Gava Silva - RM:89113} [GERADOR] Atenção: pouca pilha restante (%u words).\n", (unsigned)watermark);
+        }
+
+        esp_task_wdt_reset();
+        vTaskDelay(STALL_TICKS(GEN_PERIOD_MS));
     }
 }
 
-void vTask2(void *pvParameters) {
-    while (1) 
-    {
-        if(xSemaphoreTake(xBinarySemaphore1, portMAX_DELAY) == pdTRUE) 
-        {
-            printf("[TAREFA 1] Executou - Matheus Gava Silva\n");
+// Módulo 2 – Recepção e Transmissão
+static void task_receptora(void *pv) {
+    esp_task_wdt_add(NULL);
+
+    int timeouts = 0;
+
+    for (;;) {
+        int rx_val = 0;
+        if (xQueueReceive(g_queue, &rx_val, STALL_TICKS(RX_TIMEOUT_MS)) == pdTRUE) {
+            timeouts = 0;
+            g_hb_rx = xTaskGetTickCount();
+            g_flag_rx_ok = true;
+
+            int *tmp = (int*) malloc(sizeof(int));
+            if (!tmp) {
+                printf("{Matheus Gava Silva - RM:89113} [RECEBEDOR_TRANSMISSOR] ERRO CRÍTICO: malloc falhou – sem memória.\n");
+                g_flag_rx_ok = false;
+                break;
+            }
+            *tmp = rx_val;
+
+            printf("{Matheus Gava Silva - RM:89113} [RECEBEDOR_TRANSMISSOR] Transmitindo valor: %d\n", *tmp);
+
+            free(tmp);
+
+        } else {
+            timeouts++;
+            printf("{Matheus Gava Silva - RM:89113} [RECEBEDOR_TRANSMISSOR] Timeout de %d ms na fila (contagem=%d).\n", RX_TIMEOUT_MS, timeouts);
+
+            if (timeouts == 2) {
+                printf("{Matheus Gava Silva - RM:89113} [RECEBEDOR_TRANSMISSOR] Aviso.\n");
+            } else if (timeouts == 3) {
+                printf("{Matheus Gava Silva - RM:89113} [RECEBEDOR_TRANSMISSOR] Recuperação.\n");
+                xQueueReset(g_queue);
+            } else if (timeouts >= 4) {
+                printf("{Matheus Gava Silva - RM:89113} [RECEBEDOR_TRANSMISSOR] Encerramento.\n");
+                g_flag_rx_ok = false;
+                break;
+            }
         }
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Delay de 1 segundo
+
+        size_t free_heap = xPortGetFreeHeapSize();
+        size_t min_heap  = xPortGetMinimumEverFreeHeapSize();
+        if (free_heap < (20 * 1024)) {
+            printf("{Matheus Gava Silva - RM:89113} [RECEBEDOR_TRANSMISSOR] Pouca memória livre: %u bytes (mínimo histórico %u).\n",
+                   (unsigned)free_heap, (unsigned)min_heap);
+        }
+
+        esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
+
+    printf("{Matheus Gava Silva - RM:89113} [RECEBEDOR_TRANSMISSOR] Tarefa será finalizada para permitir recriação.\n");
+    vTaskDelete(NULL);
 }
 
-void vTask3(void *pvParameters) {
-    while (1) 
-    {
-        if(xSemaphoreTake(xBinarySemaphore2, portMAX_DELAY) == pdTRUE) 
-        {
-            printf("[TAREFA 2] Executou - Matheus Gava Silva\n");
+// Módulo 3 – Supervisão
+static void task_supervisor(void *pv) {
+    esp_task_wdt_add(NULL);
+
+    int rx_restarts = 0;
+
+    for (;;) {
+        vTaskDelay(STALL_TICKS(SUP_PERIOD_MS));
+        TickType_t now = xTaskGetTickCount();
+        g_hb_sup = now;
+
+        printf("{Matheus Gava Silva - RM:89113} [SUPERVISOR] Status – GERADOR:%s (hb=%u) | RECEBEDOR_TRANSMISSOR:%s (hb=%u)\n",
+               g_flag_gen_ok ? "OK" : "ERRO",
+               (unsigned)g_hb_gen,
+               g_flag_rx_ok  ? "OK" : "ERRO",
+               (unsigned)g_hb_rx);
+
+        if ((now - g_hb_gen) > STALL_TICKS(3 * SUP_PERIOD_MS)) {
+            printf("{Matheus Gava Silva - RM:89113} [SUPERVISOR] Detetado GERADOR inativo – reiniciando tarefa.\n");
+            if (g_task_gen) {
+                vTaskDelete(g_task_gen);
+                g_task_gen = NULL;
+            }
+            xTaskCreatePinnedToCore(task_geradora, "task_geradora",
+                                    GEN_STACK_WORDS, NULL, GEN_TASK_PRIO, &g_task_gen, 1);
+            g_hb_gen = xTaskGetTickCount();
+            g_flag_gen_ok = false;
         }
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Delay de 1 segundo
+
+        if (g_task_rx == NULL || (now - g_hb_rx) > STALL_TICKS(5 * SUP_PERIOD_MS)) {
+            printf("{Matheus Gava Silva - RM:89113} [SUPERVISOR] Detetada RECEBEDOR_TRANSMISSOR inativa – recriando tarefa.\n");
+            if (g_task_rx) {
+                vTaskDelete(g_task_rx);
+                g_task_rx = NULL;
+            }
+            xTaskCreatePinnedToCore(task_receptora, "task_receptora",
+                                    RX_STACK_WORDS, NULL, RX_TASK_PRIO, &g_task_rx, 1);
+            rx_restarts++;
+            g_hb_rx = xTaskGetTickCount();
+            g_flag_rx_ok = false;
+
+            if (rx_restarts >= 3) {
+                size_t free_heap = xPortGetFreeHeapSize();
+                if (free_heap < (16 * 1024)) {
+                    printf("{Matheus Gava Silva - RM:89113} [SUPERVISOR] Memória crítica após várias recriações (%u bytes). Reiniciando dispositivo...\n",
+                           (unsigned)free_heap);
+                    esp_restart();
+                }
+            }
+        }
+
+        size_t free_heap = xPortGetFreeHeapSize();
+        size_t min_heap  = xPortGetMinimumEverFreeHeapSize();
+        printf("{Matheus Gava Silva - RM:89113} [SUPERVISOR] Heap livre=%u bytes (mínimo histórico %u).\n",
+               (unsigned)free_heap, (unsigned)min_heap);
+        if (min_heap < (8 * 1024)) {
+            printf("{Matheus Gava Silva - RM:89113} [SUPERVISOR] Heap mínimo crítico – reiniciando dispositivo...\n");
+            esp_restart();
+        }
+
+        esp_task_wdt_reset();
     }
 }
-
-void vTask4(void *pvParameters) {
-    while (1) 
-    {
-        if(xSemaphoreTake(xBinarySemaphore3, portMAX_DELAY) == pdTRUE) 
-        {
-            printf("[TAREFA 3] Executou - Matheus Gava Silva\n");
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Delay de 1 segundo
-    }
-}
-
 
 void app_main(void) {
-    xBinarySemaphore1 = xSemaphoreCreateBinary();
-    xBinarySemaphore2 = xSemaphoreCreateBinary();
-    xBinarySemaphore3 = xSemaphoreCreateBinary();
+    printf("{Matheus Gava Silva - RM:89113} [BOOT] Iniciando sistema...\n");
+    // esp_task_wdt_deinit();
+    // esp_task_wdt_config_t wdt_cfg = {
+    //     .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
+    //     .trigger_panic = true,
+    // };
+    // esp_task_wdt_init(&wdt_cfg);
 
-    if (xBinarySemaphore1 == NULL && xBinarySemaphore2 == NULL && xBinarySemaphore3 == NULL) {
-        printf("Falha ao criar semáforo binário\n");
-        return;
+    g_queue = xQueueCreate(QUEUE_LEN, QUEUE_ITEM_SIZE);
+    if (!g_queue) {
+        printf("{Matheus Gava Silva - RM:89113} [BOOT] Falha ao criar fila. Reiniciando sistema...\n");
+        esp_restart();
     }
 
+    xTaskCreatePinnedToCore(task_geradora,  "task_geradora",   GEN_STACK_WORDS, NULL, GEN_TASK_PRIO, &g_task_gen, 1);
+    xTaskCreatePinnedToCore(task_receptora, "task_receptora",  RX_STACK_WORDS,  NULL, RX_TASK_PRIO,  &g_task_rx,  1);
+    xTaskCreatePinnedToCore(task_supervisor,"task_supervisor", SUP_STACK_WORDS, NULL, SUP_TASK_PRIO, &g_task_sup, 1);
 
-    xTaskCreate(vTask1, // Função da task
-                "Task1", // Nome da task
-                2048, // Stack size em bytes
-                NULL, // Parâmetros da task
-                5, // Prioridade da task
-                NULL /* Handle da task (opcional) */ );
-
-    xTaskCreate(vTask2, // Função da task
-                "Task2", // Nome da task
-                2048, // Stack size em bytes
-                NULL, // Parâmetros da task
-                5, // Prioridade da task
-                NULL /* Handle da task (opcional) */ );
-
-    xTaskCreate(vTask3, // Função da task
-                "Task3", // Nome da task
-                2048, // Stack size em bytes
-                NULL, // Parâmetros da task
-                5, // Prioridade da task
-                NULL /* Handle da task (opcional) */ );
-
-    xTaskCreate(vTask4, // Função da task
-                "Task4", // Nome da task
-                2048, // Stack size em bytes
-                NULL, // Parâmetros da task
-                5, // Prioridade da task
-                NULL /* Handle da task (opcional) */ );
+    printf("{Matheus Gava Silva - RM:89113} [BOOT] Sistema iniciado com sucesso.\n");
 }
