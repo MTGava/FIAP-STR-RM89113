@@ -5,4 +5,4 @@
 #
 
 ## Print execução das tasks
-![alt text](image.png)
+![alt text](image.png) 
